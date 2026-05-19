@@ -1,0 +1,10 @@
+issue,count,percent,decision
+Mixed reading date formats,686,19.9%,repair
+Invalid reading dates after parsing,0,0.0%,drop if present
+Invalid sowing dates after parsing,0,0.0%,drop if present
+Missing sensor status,137,4.0%,flag as UNKNOWN
+Bad sensor status after normalization,246,7.1%,flag and exclude from NDVI analysis
+"NDVI outside valid range [-1, 1]",104,3.0%,set NDVI to null and flag
+Duplicate parcel-date source rows,16,0.5%,collapse to one parcel-date row
+Readings with parcel_id missing from metadata,40,1.2%,drop before join
+Metadata parcels without readings,3,10.7%,document in audit
