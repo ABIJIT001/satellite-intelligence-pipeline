@@ -19,6 +19,8 @@ def parse_date_column(series: pd.Series) -> pd.Series:
     values = series.astype("string").str.strip()
     parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
 
+    # The source has both ISO dates and Indian-style slash dates, so parsing them
+    # separately avoids treating 2026-02-10 as 2 October by mistake.
     iso_mask = values.str.match(r"^\d{4}-\d{2}-\d{2}$", na=False)
     slash_mask = values.str.match(r"^\d{1,2}/\d{1,2}/\d{4}$", na=False)
     fallback_mask = ~(iso_mask | slash_mask)
@@ -40,6 +42,7 @@ def load_inputs() -> tuple[pd.DataFrame, pd.DataFrame]:
 def clean_metadata(metadata: pd.DataFrame) -> pd.DataFrame:
     cleaned = metadata.copy()
 
+    # Keep join keys and categorical fields consistent before any merge.
     for column in ["parcel_id", "mill_id", "crop_type"]:
         cleaned[column] = cleaned[column].astype("string").str.strip()
 
@@ -59,6 +62,9 @@ def clean_readings(readings: pd.DataFrame, valid_parcel_ids: set[str]) -> pd.Dat
 
     cleaned["parcel_id"] = cleaned["parcel_id"].astype("string").str.strip()
     cleaned["date"] = parse_date_column(cleaned["date"])
+
+    # Treat missing status as UNKNOWN instead of OK, because OK should only mean
+    # the sensor explicitly reported a healthy reading.
     cleaned["sensor_status"] = (
         cleaned["sensor_status"]
         .astype("string")
@@ -70,11 +76,15 @@ def clean_readings(readings: pd.DataFrame, valid_parcel_ids: set[str]) -> pd.Dat
     for column in ["ndvi_value", "temperature_c", "rainfall_mm"]:
         cleaned[column] = pd.to_numeric(cleaned[column], errors="coerce")
 
+    # NDVI outside [-1, 1] is invalid. Keep the row for weather/status context,
+    # but null the NDVI value so it cannot affect averages.
     cleaned["had_invalid_ndvi"] = ~cleaned["ndvi_value"].between(-1, 1)
     cleaned.loc[cleaned["had_invalid_ndvi"], "ndvi_value"] = pd.NA
 
     cleaned["had_bad_source_status"] = cleaned["sensor_status"] != "OK"
 
+    # Rows without metadata cannot support crop-level analysis, so remove them
+    # before the join and record the decision in the audit output.
     cleaned = cleaned.dropna(subset=["parcel_id", "date"])
     cleaned = cleaned[cleaned["parcel_id"].isin(valid_parcel_ids)]
 
@@ -83,6 +93,9 @@ def clean_readings(readings: pd.DataFrame, valid_parcel_ids: set[str]) -> pd.Dat
 
 def resolve_sensor_status(statuses: pd.Series) -> str:
     values = set(statuses.dropna())
+
+    # For duplicate source rows, one healthy reading is enough to keep the
+    # parcel-date usable while still preserving source quality flags separately.
     if "OK" in values:
         return "OK"
     if "ERROR" in values:
@@ -91,6 +104,8 @@ def resolve_sensor_status(statuses: pd.Series) -> str:
 
 
 def collapse_duplicate_readings(readings: pd.DataFrame) -> pd.DataFrame:
+    # The final dataset must be one row per parcel and date. Numeric readings are
+    # averaged, while status and quality flags summarize the source rows.
     grouped = (
         readings
         .groupby(["parcel_id", "date"], as_index=False)
@@ -117,6 +132,8 @@ def build_clean_timeseries(metadata: pd.DataFrame, readings: pd.DataFrame) -> pd
     logging.info("Joining readings with parcel metadata")
     joined = cleaned_readings.merge(cleaned_metadata, on="parcel_id", how="left", validate="many_to_one")
 
+    # Keep a stable column order so reviewers and downstream queries see the same
+    # layout every time the pipeline is run.
     ordered_columns = [
         "parcel_id",
         "date",
@@ -140,10 +157,15 @@ def build_clean_timeseries(metadata: pd.DataFrame, readings: pd.DataFrame) -> pd
 def analyze_crop_ndvi(cleaned: pd.DataFrame) -> pd.DataFrame:
     logging.info("Computing crop-level NDVI summary")
     analysis_rows = []
+
+    # The brief asks us to ignore bad sensor rows for this metric, so only OK
+    # readings with valid NDVI values are used in the before/after windows.
     usable = cleaned[(cleaned["sensor_status"] == "OK") & cleaned["ndvi_value"].notna()].copy()
     usable["days_from_sowing"] = (usable["date"] - usable["sowing_date"]).dt.days
 
     for crop_type, crop_data in usable.groupby("crop_type", sort=True):
+        # Use the 30 complete days before and after sowing; day 0 is excluded so
+        # the two windows do not mix the sowing day into either side.
         before = crop_data[crop_data["days_from_sowing"].between(-30, -1)]
         after = crop_data[crop_data["days_from_sowing"].between(1, 30)]
         contributing_parcels = pd.concat([before["parcel_id"], after["parcel_id"]]).nunique()
